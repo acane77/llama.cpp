@@ -758,6 +758,11 @@ struct test {
 
     std::vector<double> get_ts() const {
         int n_tokens = n_prompt + n_gen;
+        // if (n_prompt > 0 && n_gen > 0) {
+        //     fprintf(stderr, "!!!!!!!! n_prompt = %d, n_gen = %d\n", n_prompt, n_gen);
+        //     abort();
+        // }
+        //fprintf(stderr, ">>>>>>>> n_prompt = %d, n_gen = %d\n", n_prompt, n_gen);
         std::vector<double> ts;
         std::transform(samples_ns.begin(), samples_ns.end(), std::back_inserter(ts), [n_tokens](uint64_t t) { return 1e9 * n_tokens / t; });
         return ts;
@@ -887,7 +892,7 @@ struct test {
 const std::string test::build_commit = LLAMA_COMMIT;
 const int         test::build_number = LLAMA_BUILD_NUMBER;
 const bool        test::cuda         = !!ggml_cpu_has_cuda();
-const bool        test::opencl       = !!ggml_cpu_has_clblast();
+const bool        test::opencl       = false; // !!ggml_cpu_has_clblast();
 const bool        test::vulkan       = !!ggml_cpu_has_vulkan();
 const bool        test::kompute      = !!ggml_cpu_has_kompute();
 const bool        test::metal        = !!ggml_cpu_has_metal();
@@ -1210,7 +1215,18 @@ struct sql_printer : public printer {
     }
 };
 
-static void test_prompt(llama_context * ctx, int n_prompt, int n_past, int n_batch, int n_threads) {
+static void float_vector_normalize(float* embd, size_t sz) {
+    float norm = 0;
+    for (size_t i = 0; i < sz; i++) {
+        norm += embd[i] * embd[i];
+    }
+    norm = sqrt(norm);
+    for (size_t i = 0; i < sz; i++) {
+        embd[i] /= norm;
+    }
+}
+
+static void test_prompt(llama_context * ctx, int n_prompt, float* embedding, int n_past, int n_batch, int n_threads) {
     llama_set_n_threads(ctx, n_threads, n_threads);
 
     const llama_model * model = llama_get_model(ctx);
@@ -1226,14 +1242,21 @@ static void test_prompt(llama_context * ctx, int n_prompt, int n_past, int n_bat
         for (int i = 1; i < n_tokens; i++) {
             tokens[i] = std::rand() % n_vocab;
         }
-        llama_decode(ctx, llama_batch_get_one(tokens.data(), n_tokens, n_past + n_processed, 0));
+        auto batch = llama_batch_get_one(nullptr, n_tokens, n_past + n_processed, 0);
+        if (embedding == nullptr) {
+            batch.token = tokens.data();
+        }
+        else {
+            batch.embd = embedding + n_processed * 3072;
+        }
+        llama_decode(ctx, batch);
         n_processed += n_tokens;
     }
 
     llama_synchronize(ctx);
 }
 
-static void test_gen(llama_context * ctx, int n_gen, int n_past, int n_threads) {
+static void test_gen(llama_context * ctx, int n_gen, int use_embd, int n_past, int n_threads) {
     llama_set_n_threads(ctx, n_threads, n_threads);
 
     const llama_model * model = llama_get_model(ctx);
@@ -1241,8 +1264,22 @@ static void test_gen(llama_context * ctx, int n_gen, int n_past, int n_threads) 
 
     llama_token token = llama_add_bos_token(model) ? llama_token_bos(model) : std::rand() % n_vocab;
 
+    std::vector<float> embedding(3072);
+
     for (int i = 0; i < n_gen; i++) {
-        llama_decode(ctx, llama_batch_get_one(&token, 1, n_past + i, 0));
+        auto batch = llama_batch_get_one(nullptr, 1, n_past + i, 0);
+
+        if (!use_embd) {
+            batch.token = &token;
+        }
+        else {
+            for (auto &f : embedding) {
+                f = (std::rand() % 10000) / 10000.f;
+            }
+            float_vector_normalize(embedding.data(), 3072);
+            batch.embd = embedding.data();
+        }
+        llama_decode(ctx, batch);
         llama_synchronize(ctx);
         token = std::rand() % n_vocab;
     }
@@ -1306,7 +1343,29 @@ int main(int argc, char ** argv) {
     llama_model * lmodel = nullptr;
     const cmd_params_instance * prev_inst = nullptr;
 
+    std::vector<cmd_params_instance> prompt_insts, decode_insts;
     for (const auto & inst : params_instances) {
+        if (inst.n_prompt > 0) {
+            prompt_insts.push_back(inst);
+        }
+        else if (inst.n_gen > 0) {
+            decode_insts.push_back(inst);
+        }
+        else {
+            fprintf(stderr, "WARNING: add param: both inst.n_gen and inst.n_prompt is zero\n");
+        }
+    }
+
+    std::vector<cmd_params_instance> pd_fusion_insts;
+    for (auto& pi: prompt_insts) {
+        for (auto& di: decode_insts) {
+            pi.n_gen = di.n_gen;
+            pd_fusion_insts.push_back(pi);
+            fprintf(stderr, "****** Add test: prompt %d   decode: %d\n", pi.n_prompt, pi.n_gen);
+        }
+    }
+
+    for (const auto & inst : pd_fusion_insts) {
         // keep the same model between tests when possible
         if (!lmodel || !prev_inst || !inst.equal_mparams(*prev_inst)) {
             if (lmodel) {
@@ -1335,11 +1394,21 @@ int main(int argc, char ** argv) {
         // warmup run
         if (t.n_prompt > 0) {
             //test_prompt(ctx, std::min(t.n_batch, std::min(t.n_prompt, 32)), 0, t.n_batch, t.n_threads);
-            test_prompt(ctx, t.n_prompt, 0, t.n_batch, t.n_threads);
+            test_prompt(ctx, t.n_prompt, nullptr, 0, t.n_batch, t.n_threads);
         }
         if (t.n_gen > 0) {
-            test_gen(ctx, 1, 0, t.n_threads);
+            test_gen(ctx, 1, 0, 0, t.n_threads);
         }
+
+        std::vector<float> input_embed(t.n_prompt * 3072);
+        for (auto& f: input_embed) {
+            f = (std::rand() % 10000) / 10000.f;
+        }
+        for (int i=0; i<t.n_prompt; i++) {
+            float_vector_normalize(input_embed.data() + i * 3072, 3072);
+        }
+
+        fprintf(stderr, "----> test case: n_prompt=%d, n_gen=%d\n", t.n_prompt, t.n_gen);
 
         for (int i = 0; i < params.reps; i++) {
             llama_kv_cache_clear(ctx);
@@ -1347,10 +1416,10 @@ int main(int argc, char ** argv) {
             uint64_t t_start = get_time_ns();
 
             if (t.n_prompt > 0) {
-                test_prompt(ctx, t.n_prompt, 0, t.n_batch, t.n_threads);
+                test_prompt(ctx, t.n_prompt, input_embed.data(), 0, t.n_batch, t.n_threads);
             }
             if (t.n_gen > 0) {
-                test_gen(ctx, t.n_gen, t.n_prompt, t.n_threads);
+                test_gen(ctx, t.n_gen, 1, t.n_prompt, t.n_threads);
             }
 
             uint64_t t_ns = get_time_ns() - t_start;
