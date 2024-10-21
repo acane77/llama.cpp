@@ -189,6 +189,7 @@ struct cmd_params {
     int reps;
     bool verbose;
     output_formats output_format;
+    bool input_embedding;
 };
 
 static const cmd_params cmd_params_defaults = {
@@ -212,7 +213,8 @@ static const cmd_params cmd_params_defaults = {
     /* numa          */ GGML_NUMA_STRATEGY_DISABLED,
     /* reps          */ 5,
     /* verbose       */ false,
-    /* output_format */ MARKDOWN
+    /* output_format */ MARKDOWN,
+    /* input_embedding */ false
 };
 
 static void print_usage(int /* argc */, char ** argv) {
@@ -241,6 +243,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -r, --repetitions <n>               (default: %d)\n", cmd_params_defaults.reps);
     printf("  -o, --output <csv|json|md|sql>      (default: %s)\n", output_format_str(cmd_params_defaults.output_format));
     printf("  -v, --verbose                       (default: %s)\n", cmd_params_defaults.verbose ? "1" : "0");
+    printf("  -E, --input-embeddings              (default: %s)\n", cmd_params_defaults.input_embedding ? "1" : "0");
     printf("\n");
     printf("Multiple values can be given for each parameter by separating them with ',' or by specifying the parameter multiple times.\n");
 }
@@ -498,6 +501,8 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
             }
         } else if (arg == "-v" || arg == "--verbose") {
             params.verbose = true;
+        } else if (arg == "-E" || arg == "--input-embedding") {
+            params.input_embedding = true;
         } else {
             invalid_param = true;
             break;
@@ -716,7 +721,8 @@ struct test {
     int n_prompt;
     int n_gen;
     std::string test_time;
-    std::vector<uint64_t> samples_ns;
+    std::vector<uint64_t> samples_ns_prefill;
+    std::vector<uint64_t> samples_ns_decode;
 
     test(const cmd_params_instance & inst, const llama_model * lmodel, const llama_context * ctx) {
         model_filename = inst.model;
@@ -748,32 +754,60 @@ struct test {
         (void) ctx;
     }
 
-    uint64_t avg_ns() const {
-        return ::avg(samples_ns);
+    uint64_t avg_ns_decode() const {
+        return ::avg(samples_ns_decode);
     }
 
-    uint64_t stdev_ns() const {
-        return ::stdev(samples_ns);
+    uint64_t avg_ns_prefill() const {
+        return ::avg(samples_ns_prefill);
     }
 
-    std::vector<double> get_ts() const {
-        int n_tokens = n_prompt + n_gen;
+    uint64_t stdev_ns_decode() const {
+        return ::stdev(samples_ns_decode);
+    }
+
+    uint64_t stdev_ns_prefill() const {
+        return ::stdev(samples_ns_prefill);
+    }
+
+    std::vector<double> get_decode_ts() const {
+        int n_tokens = n_gen;
         // if (n_prompt > 0 && n_gen > 0) {
         //     fprintf(stderr, "!!!!!!!! n_prompt = %d, n_gen = %d\n", n_prompt, n_gen);
         //     abort();
         // }
         //fprintf(stderr, ">>>>>>>> n_prompt = %d, n_gen = %d\n", n_prompt, n_gen);
         std::vector<double> ts;
-        std::transform(samples_ns.begin(), samples_ns.end(), std::back_inserter(ts), [n_tokens](uint64_t t) { return 1e9 * n_tokens / t; });
+        std::transform(samples_ns_decode.begin(), samples_ns_decode.end(), std::back_inserter(ts), [n_tokens](uint64_t t) { return 1e9 * n_tokens / t; });
         return ts;
     }
 
-    double avg_ts() const {
-        return ::avg(get_ts());
+    std::vector<double> get_prefill_ts() const {
+        int n_tokens = n_prompt;
+        // if (n_prompt > 0 && n_gen > 0) {
+        //     fprintf(stderr, "!!!!!!!! n_prompt = %d, n_gen = %d\n", n_prompt, n_gen);
+        //     abort();
+        // }
+        //fprintf(stderr, ">>>>>>>> n_prompt = %d, n_gen = %d\n", n_prompt, n_gen);
+        std::vector<double> ts;
+        std::transform(samples_ns_prefill.begin(), samples_ns_prefill.end(), std::back_inserter(ts), [n_tokens](uint64_t t) { return 1e9 * n_tokens / t; });
+        return ts;
     }
 
-    double stdev_ts() const {
-        return ::stdev(get_ts());
+    double prefill_avg_ts() const {
+        return ::avg(get_prefill_ts());
+    }
+
+    double decode_avg_ts() const {
+        return ::avg(get_decode_ts());
+    }
+
+    double prefill_stdev_ts() const {
+        return ::stdev(get_prefill_ts());
+    }
+
+    double decode_stdev_ts() const {
+        return ::stdev(get_decode_ts());
     }
 
     static std::string get_backend() {
@@ -817,8 +851,10 @@ struct test {
             "main_gpu", "no_kv_offload", "flash_attn",
             "tensor_split", "use_mmap", "embeddings",
             "n_prompt", "n_gen", "test_time",
-            "avg_ns", "stddev_ns",
-            "avg_ts", "stddev_ts"
+            "avg_ns_prefill", "stddev_ns_prefill",
+            "avg_ns_decode", "stddev_ns_decode",
+            "avg_ts_prefill", "stddev_ts_prefill",
+            "avg_ts_decode", "stddev_ts_decode",
         };
         return fields;
     }
@@ -873,8 +909,10 @@ struct test {
             std::to_string(main_gpu), std::to_string(no_kv_offload), std::to_string(flash_attn),
             tensor_split_str, std::to_string(use_mmap), std::to_string(embeddings),
             std::to_string(n_prompt), std::to_string(n_gen), test_time,
-            std::to_string(avg_ns()), std::to_string(stdev_ns()),
-            std::to_string(avg_ts()), std::to_string(stdev_ts())
+            std::to_string(avg_ns_prefill()), std::to_string(stdev_ns_prefill()),
+            std::to_string(avg_ns_decode()), std::to_string(stdev_ns_decode()),
+            std::to_string(prefill_avg_ts()), std::to_string(prefill_stdev_ts()),
+            std::to_string(decode_avg_ts()), std::to_string(decode_stdev_ts())
         };
         return values;
     }
@@ -989,8 +1027,10 @@ struct json_printer : public printer {
         }
         fprintf(fout, "  {\n");
         print_fields(test::get_fields(), t.get_values());
-        fprintf(fout, "    \"samples_ns\": [ %s ],\n", join(t.samples_ns, ", ").c_str());
-        fprintf(fout, "    \"samples_ts\": [ %s ]\n", join(t.get_ts(), ", ").c_str());
+        fprintf(fout, "    \"samples_ns_prefill\": [ %s ],\n", join(t.samples_ns_prefill, ", ").c_str());
+        fprintf(fout, "    \"samples_ts_prefill\": [ %s ]\n", join(t.get_prefill_ts(), ", ").c_str());
+        fprintf(fout, "    \"samples_ns_decode\": [ %s ],\n", join(t.samples_ns_decode, ", ").c_str());
+        fprintf(fout, "    \"samples_ts_decode\": [ %s ]\n", join(t.get_decode_ts(), ", ").c_str());
         fprintf(fout, "  }");
         fflush(fout);
     }
@@ -1007,7 +1047,10 @@ struct markdown_printer : public printer {
         if (field == "model") {
             return -30;
         }
-        if (field == "t/s") {
+        if (field == "prefill (t/s)") {
+            return 16;
+        }
+        if (field == "decode (t/s)") {
             return 16;
         }
         if (field == "size" || field == "params") {
@@ -1103,7 +1146,8 @@ struct markdown_printer : public printer {
             fields.emplace_back("embeddings");
         }
         fields.emplace_back("test");
-        fields.emplace_back("t/s");
+        fields.emplace_back("prefill (t/s)");
+        fields.emplace_back("decode (t/s)");
 
         fprintf(fout, "|");
         for (const auto & field : fields) {
@@ -1152,8 +1196,11 @@ struct markdown_printer : public printer {
                     snprintf(buf, sizeof(buf), "pp%d+tg%d", t.n_prompt, t.n_gen);
                 }
                 value = buf;
-            } else if (field == "t/s") {
-                snprintf(buf, sizeof(buf), "%.2f ± %.2f", t.avg_ts(), t.stdev_ts());
+            } else if (field == "prefill (t/s)") {
+                snprintf(buf, sizeof(buf), "%.2f ± %.2f", t.prefill_avg_ts(), t.prefill_stdev_ts());
+                value = buf;
+            } else if (field == "decode (t/s)") {
+                snprintf(buf, sizeof(buf), "%.2f ± %.2f", t.decode_avg_ts(), t.decode_stdev_ts());
                 value = buf;
             } else if (vmap.find(field) != vmap.end()) {
                 value = vmap.at(field);
@@ -1343,13 +1390,19 @@ int main(int argc, char ** argv) {
     llama_model * lmodel = nullptr;
     const cmd_params_instance * prev_inst = nullptr;
 
+    if (params.input_embedding) {
+        fprintf(stderr, "-- Note: Use embedding as model input");
+    }
+
     std::vector<cmd_params_instance> prompt_insts, decode_insts;
     for (const auto & inst : params_instances) {
         if (inst.n_prompt > 0) {
             prompt_insts.push_back(inst);
+            fprintf(stderr, "  >> found prompt: %d\n", inst.n_prompt);
         }
         else if (inst.n_gen > 0) {
             decode_insts.push_back(inst);
+            fprintf(stderr, "  << found decode: %d\n", inst.n_gen);
         }
         else {
             fprintf(stderr, "WARNING: add param: both inst.n_gen and inst.n_prompt is zero\n");
@@ -1393,11 +1446,10 @@ int main(int argc, char ** argv) {
 
         // warmup run
         if (t.n_prompt > 0) {
-            //test_prompt(ctx, std::min(t.n_batch, std::min(t.n_prompt, 32)), 0, t.n_batch, t.n_threads);
-            test_prompt(ctx, t.n_prompt, nullptr, 0, t.n_batch, t.n_threads);
+            test_prompt(ctx, std::min(t.n_batch, std::min(t.n_prompt, 32)), nullptr, 0, t.n_batch, t.n_threads);
         }
         if (t.n_gen > 0) {
-            test_gen(ctx, 1, 0, 0, t.n_threads);
+            test_gen(ctx, t.n_gen, 0, 0, t.n_threads);
         }
 
         std::vector<float> input_embed(t.n_prompt * 3072);
@@ -1413,17 +1465,19 @@ int main(int argc, char ** argv) {
         for (int i = 0; i < params.reps; i++) {
             llama_kv_cache_clear(ctx);
 
-            uint64_t t_start = get_time_ns();
-
             if (t.n_prompt > 0) {
-                test_prompt(ctx, t.n_prompt, input_embed.data(), 0, t.n_batch, t.n_threads);
+                uint64_t t_start = get_time_ns();
+                // test_prompt(ctx, t.n_prompt, input_embed.data(), 0, t.n_batch, t.n_threads);
+                test_prompt(ctx, t.n_prompt, params.input_embedding ? input_embed.data() : nullptr, 0, t.n_batch, t.n_threads);
+                uint64_t t_ns = get_time_ns() - t_start;
+                t.samples_ns_prefill.push_back(t_ns);
             }
             if (t.n_gen > 0) {
-                test_gen(ctx, t.n_gen, 1, t.n_prompt, t.n_threads);
+                uint64_t t_start = get_time_ns();
+                test_gen(ctx, t.n_gen, params.input_embedding, t.n_prompt, t.n_threads);
+                uint64_t t_ns = get_time_ns() - t_start;
+                t.samples_ns_decode.push_back(t_ns);
             }
-
-            uint64_t t_ns = get_time_ns() - t_start;
-            t.samples_ns.push_back(t_ns);
         }
 
         p->print_test(t);
